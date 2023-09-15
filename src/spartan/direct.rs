@@ -23,7 +23,10 @@ struct DirectCircuit<G: Group, SC: StepCircuit<G::Scalar>> {
 }
 
 impl<G: Group, SC: StepCircuit<G::Scalar>> Circuit<G::Scalar> for DirectCircuit<G, SC> {
-  fn synthesize<CS: ConstraintSystem<G::Scalar>>(self, cs: &mut CS) -> Result<(), SynthesisError> {
+  fn synthesize<CS: ConstraintSystem<G::Scalar>>(
+    mut self,
+    cs: &mut CS,
+  ) -> Result<(), SynthesisError> {
     // obtain the arity information
     let arity = self.sc.arity();
 
@@ -172,7 +175,7 @@ mod tests {
     }
 
     fn synthesize<CS: ConstraintSystem<F>>(
-      &self,
+      &mut self,
       cs: &mut CS,
       z: &[AllocatedNum<F>],
     ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {

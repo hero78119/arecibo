@@ -128,10 +128,11 @@ where
     let ro_consts_circuit_secondary: ROConstantsCircuit<G1> = ROConstantsCircuit::<G1>::default();
 
     // Initialize ck for the primary
+    let mut c_primary = c_primary.clone();
     let circuit_primary: NovaAugmentedCircuit<'_, G2, C1> = NovaAugmentedCircuit::new(
       &augmented_circuit_params_primary,
       None,
-      c_primary,
+      &mut c_primary,
       ro_consts_circuit_primary.clone(),
     );
     let mut cs: ShapeCS<G1> = ShapeCS::new();
@@ -139,10 +140,11 @@ where
     let (r1cs_shape_primary, ck_primary) = cs.r1cs_shape_and_key(optfn1);
 
     // Initialize ck for the secondary
+    let mut c_secondary = c_secondary.clone();
     let circuit_secondary: NovaAugmentedCircuit<'_, G1, C2> = NovaAugmentedCircuit::new(
       &augmented_circuit_params_secondary,
       None,
-      c_secondary,
+      &mut c_secondary,
       ro_consts_circuit_secondary.clone(),
     );
     let mut cs: ShapeCS<G2> = ShapeCS::new();
@@ -294,8 +296,8 @@ where
   /// Create new instance of recursive SNARK
   pub fn new(
     pp: &PublicParams<G1, G2, C1, C2>,
-    c_primary: &C1,
-    c_secondary: &C2,
+    c_primary: &mut C1,
+    c_secondary: &mut C2,
     z0_primary: Vec<G1::Scalar>,
     z0_secondary: Vec<G2::Scalar>,
   ) -> Self {
@@ -404,8 +406,8 @@ where
   pub fn prove_step(
     &mut self,
     pp: &PublicParams<G1, G2, C1, C2>,
-    c_primary: &C1,
-    c_secondary: &C2,
+    c_primary: &mut C1,
+    c_secondary: &mut C2,
     z0_primary: Vec<G1::Scalar>,
     z0_secondary: Vec<G2::Scalar>,
   ) -> Result<(), NovaError> {
@@ -904,8 +906,11 @@ type CE<G> = <G as Group>::CE;
 
 #[cfg(test)]
 mod tests {
+  use crate::gadgets::lookup::{less_than, Lookup, LookupTransaction};
+  use crate::gadgets::utils::{alloc_const, conditionally_select2};
   use crate::provider::bn256_grumpkin::{bn256, grumpkin};
   use crate::provider::pedersen::CommitmentKeyExtTrait;
+  use crate::provider::poseidon::PoseidonConstantsCircuit;
   use crate::provider::secp_secq::{secp256k1, secq256k1};
 
   use super::*;
@@ -935,7 +940,7 @@ mod tests {
     }
 
     fn synthesize<CS: ConstraintSystem<F>>(
-      &self,
+      &mut self,
       cs: &mut CS,
       z: &[AllocatedNum<F>],
     ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
@@ -1061,8 +1066,8 @@ mod tests {
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
   {
-    let test_circuit1 = TrivialTestCircuit::<<G1 as Group>::Scalar>::default();
-    let test_circuit2 = TrivialTestCircuit::<<G2 as Group>::Scalar>::default();
+    let mut test_circuit1 = TrivialTestCircuit::<<G1 as Group>::Scalar>::default();
+    let mut test_circuit2 = TrivialTestCircuit::<<G2 as Group>::Scalar>::default();
 
     // produce public parameters
     let pp = PublicParams::<
@@ -1078,16 +1083,16 @@ mod tests {
     // produce a recursive SNARK
     let mut recursive_snark = RecursiveSNARK::new(
       &pp,
-      &test_circuit1,
-      &test_circuit2,
+      &mut test_circuit1,
+      &mut test_circuit2,
       vec![<G1 as Group>::Scalar::ZERO],
       vec![<G2 as Group>::Scalar::ZERO],
     );
 
     let res = recursive_snark.prove_step(
       &pp,
-      &test_circuit1,
-      &test_circuit2,
+      &mut test_circuit1,
+      &mut test_circuit2,
       vec![<G1 as Group>::Scalar::ZERO],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1119,8 +1124,8 @@ mod tests {
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
   {
-    let circuit_primary = TrivialTestCircuit::default();
-    let circuit_secondary = CubicCircuit::default();
+    let mut circuit_primary = TrivialTestCircuit::default();
+    let mut circuit_secondary = CubicCircuit::default();
 
     // produce public parameters
     let pp = PublicParams::<
@@ -1141,8 +1146,8 @@ mod tests {
       CubicCircuit<<G2 as Group>::Scalar>,
     >::new(
       &pp,
-      &circuit_primary,
-      &circuit_secondary,
+      &mut circuit_primary,
+      &mut circuit_secondary,
       vec![<G1 as Group>::Scalar::ONE],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1150,8 +1155,8 @@ mod tests {
     for i in 0..num_steps {
       let res = recursive_snark.prove_step(
         &pp,
-        &circuit_primary,
-        &circuit_secondary,
+        &mut circuit_primary,
+        &mut circuit_secondary,
         vec![<G1 as Group>::Scalar::ONE],
         vec![<G2 as Group>::Scalar::ZERO],
       );
@@ -1209,8 +1214,8 @@ mod tests {
     <<G1 as Group>::Scalar as PrimeField>::Repr: Abomonation,
     <<G2 as Group>::Scalar as PrimeField>::Repr: Abomonation,
   {
-    let circuit_primary = TrivialTestCircuit::default();
-    let circuit_secondary = CubicCircuit::default();
+    let mut circuit_primary = TrivialTestCircuit::default();
+    let mut circuit_secondary = CubicCircuit::default();
 
     // produce public parameters
     let pp = PublicParams::<
@@ -1231,8 +1236,8 @@ mod tests {
       CubicCircuit<<G2 as Group>::Scalar>,
     >::new(
       &pp,
-      &circuit_primary,
-      &circuit_secondary,
+      &mut circuit_primary,
+      &mut circuit_secondary,
       vec![<G1 as Group>::Scalar::ONE],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1240,8 +1245,8 @@ mod tests {
     for _i in 0..num_steps {
       let res = recursive_snark.prove_step(
         &pp,
-        &circuit_primary,
-        &circuit_secondary,
+        &mut circuit_primary,
+        &mut circuit_secondary,
         vec![<G1 as Group>::Scalar::ONE],
         vec![<G2 as Group>::Scalar::ZERO],
       );
@@ -1307,8 +1312,8 @@ mod tests {
     <<G1 as Group>::Scalar as PrimeField>::Repr: Abomonation,
     <<G2 as Group>::Scalar as PrimeField>::Repr: Abomonation,
   {
-    let circuit_primary = TrivialTestCircuit::default();
-    let circuit_secondary = CubicCircuit::default();
+    let mut circuit_primary = TrivialTestCircuit::default();
+    let mut circuit_secondary = CubicCircuit::default();
 
     // produce public parameters, which we'll use with a spark-compressed SNARK
     let pp = PublicParams::<
@@ -1334,8 +1339,8 @@ mod tests {
       CubicCircuit<<G2 as Group>::Scalar>,
     >::new(
       &pp,
-      &circuit_primary,
-      &circuit_secondary,
+      &mut circuit_primary,
+      &mut circuit_secondary,
       vec![<G1 as Group>::Scalar::ONE],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1343,8 +1348,8 @@ mod tests {
     for _i in 0..num_steps {
       let res = recursive_snark.prove_step(
         &pp,
-        &circuit_primary,
-        &circuit_secondary,
+        &mut circuit_primary,
+        &mut circuit_secondary,
         vec![<G1 as Group>::Scalar::ONE],
         vec![<G2 as Group>::Scalar::ZERO],
       );
@@ -1448,7 +1453,7 @@ mod tests {
       }
 
       fn synthesize<CS: ConstraintSystem<F>>(
-        &self,
+        &mut self,
         cs: &mut CS,
         z: &[AllocatedNum<F>],
       ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
@@ -1477,7 +1482,7 @@ mod tests {
       y: <G1 as Group>::Scalar::ZERO,
     };
 
-    let circuit_secondary = TrivialTestCircuit::default();
+    let mut circuit_secondary = TrivialTestCircuit::default();
 
     // produce public parameters
     let pp = PublicParams::<
@@ -1491,7 +1496,7 @@ mod tests {
     let num_steps = 3;
 
     // produce non-deterministic advice
-    let (z0_primary, roots) = FifthRootCheckingCircuit::new(num_steps);
+    let (z0_primary, mut roots) = FifthRootCheckingCircuit::new(num_steps);
     let z0_secondary = vec![<G2 as Group>::Scalar::ZERO];
 
     // produce a recursive SNARK
@@ -1507,17 +1512,17 @@ mod tests {
       TrivialTestCircuit<<G2 as Group>::Scalar>,
     >::new(
       &pp,
-      &roots[0],
-      &circuit_secondary,
+      &mut roots[0],
+      &mut circuit_secondary,
       z0_primary.clone(),
       z0_secondary.clone(),
     );
 
-    for circuit_primary in roots.iter().take(num_steps) {
+    for mut circuit_primary in roots.iter_mut().take(num_steps) {
       let res = recursive_snark.prove_step(
         &pp,
-        circuit_primary,
-        &circuit_secondary.clone(),
+        &mut circuit_primary,
+        &mut circuit_secondary.clone(),
         z0_primary.clone(),
         z0_secondary.clone(),
       );
@@ -1556,8 +1561,8 @@ mod tests {
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
   {
-    let test_circuit1 = TrivialTestCircuit::<<G1 as Group>::Scalar>::default();
-    let test_circuit2 = CubicCircuit::<<G2 as Group>::Scalar>::default();
+    let mut test_circuit1 = TrivialTestCircuit::<<G1 as Group>::Scalar>::default();
+    let mut test_circuit2 = CubicCircuit::<<G2 as Group>::Scalar>::default();
 
     // produce public parameters
     let pp = PublicParams::<
@@ -1578,8 +1583,8 @@ mod tests {
       CubicCircuit<<G2 as Group>::Scalar>,
     >::new(
       &pp,
-      &test_circuit1,
-      &test_circuit2,
+      &mut test_circuit1,
+      &mut test_circuit2,
       vec![<G1 as Group>::Scalar::ONE],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1587,8 +1592,8 @@ mod tests {
     // produce a recursive SNARK
     let res = recursive_snark.prove_step(
       &pp,
-      &test_circuit1,
-      &test_circuit2,
+      &mut test_circuit1,
+      &mut test_circuit2,
       vec![<G1 as Group>::Scalar::ONE],
       vec![<G2 as Group>::Scalar::ZERO],
     );
@@ -1618,5 +1623,223 @@ mod tests {
     test_ivc_base_with::<G1, G2>();
     test_ivc_base_with::<bn256::Point, grumpkin::Point>();
     test_ivc_base_with::<secp256k1::Point, secq256k1::Point>();
+  }
+
+  #[test]
+  fn test_ivc_rwlookup() {
+    type G1 = pasta_curves::pallas::Point;
+    type G2 = pasta_curves::vesta::Point;
+
+    // rw lookup to serve as a non-deterministic advices.
+    #[derive(Clone)]
+    struct HeapifyCircuit<G: Group> {
+      lookup: Lookup<G::Base>,
+      ro_consts: ROConstantsCircuit<G>,
+    }
+
+    impl<G: Group> HeapifyCircuit<G>
+    where
+      <G as traits::Group>::Base: std::cmp::Ord,
+    {
+      fn new(ro_consts: ROConstantsCircuit<G>) -> (Self, Vec<G::Base>) {
+        let initial_table = (0..64)
+          .map(|i| {
+            (
+              <G as Group>::Base::from(i),
+              <G as Group>::Base::from(63 - i),
+            )
+          })
+          .collect();
+        let lookup = Lookup::new(true, initial_table);
+        // TODO compute global challenge `gamma` by simulating rw trace
+        let gamma = G::Base::from(3);
+
+        let (
+          initial_intermediate_gamma,
+          gamma,
+          init_prev_R,
+          init_prev_W,
+          init_rw_counter,
+          initial_index,
+        ) = (
+          G::Base::from(1),
+          gamma,
+          G::Base::from(1),
+          G::Base::from(1),
+          G::Base::from(0),
+          G::Base::from(31),
+        );
+
+        (
+          HeapifyCircuit { lookup, ro_consts },
+          vec![
+            initial_intermediate_gamma,
+            gamma,
+            init_prev_R,
+            init_prev_W,
+            init_rw_counter,
+            initial_index,
+          ],
+        )
+      }
+    }
+
+    impl<F: PrimeField, G: Group + traits::Group<Base = F>> StepCircuit<F> for HeapifyCircuit<G>
+    where
+      G::Base: std::cmp::Ord,
+    {
+      fn arity(&self) -> usize {
+        6
+      }
+
+      fn synthesize<CS: ConstraintSystem<F>>(
+        &mut self,
+        cs: &mut CS,
+        z: &[AllocatedNum<F>],
+      ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
+        let mut lookup_transaction = LookupTransaction::<G>::start_transaction(&mut self.lookup);
+        let prev_intermediate_gamma = &z[0];
+        let gamma = &z[1];
+        let prev_R = &z[2];
+        let prev_W = &z[3];
+        let prev_rw_counter = &z[4];
+        let index = &z[5];
+
+        let two = alloc_const(cs.namespace(|| "2"), F::from(2))?;
+        let left_child_index = index.mul(cs.namespace(|| "left_child_index"), &two)?;
+        let right_child_index = AllocatedNum::alloc(cs.namespace(|| "right_child_index"), || {
+          left_child_index
+            .get_value()
+            .map(|i| i + F::ONE)
+            .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        cs.enforce(
+          || "(left_child_index + 1) * 1 = right_child_index",
+          |lc| lc + left_child_index.get_variable() + CS::one(),
+          |lc| lc + CS::one(),
+          |lc| lc + right_child_index.get_variable(),
+        );
+        let parent = lookup_transaction.read(cs.namespace(|| "parent"), &index)?;
+        let left_child =
+          lookup_transaction.read(cs.namespace(|| "left_child"), &left_child_index)?;
+        let right_child =
+          lookup_transaction.read(cs.namespace(|| "right_child"), &right_child_index)?;
+
+        let is_left_child_smaller = less_than(
+          cs.namespace(|| "left_child < parent"),
+          &left_child,
+          &parent,
+          10, // node value < 2**10 = 1024
+        )?;
+
+        let tmp = conditionally_select2(
+          cs.namespace(|| "left pair smaller"),
+          &left_child,
+          &parent,
+          &is_left_child_smaller,
+        )?;
+
+        let is_right_child_smaller = less_than(
+          cs.namespace(|| "right_child < parent"),
+          &right_child,
+          &tmp,
+          10, // node value < 2**10 = 1024
+        )?;
+
+        let smallest = conditionally_select2(
+          cs.namespace(|| "right pair smaller"),
+          &right_child,
+          &tmp,
+          &is_right_child_smaller,
+        )?;
+
+        lookup_transaction.write(&index, &smallest)?;
+
+        // commit the rw change
+        let (next_R, next_W, next_rw_counter, next_intermediate_gamma) = lookup_transaction
+          .commit(
+            cs.namespace(|| "commit"),
+            self.ro_consts.clone(),
+            prev_intermediate_gamma,
+            &gamma,
+            prev_W,
+            prev_R,
+            prev_rw_counter,
+          )?;
+
+        let next_index = AllocatedNum::alloc(cs.namespace(|| "next_index"), || {
+          index
+            .get_value()
+            .map(|index| index - G::Base::from(1))
+            .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        cs.enforce(
+          || "(next_index + 1) * 1 = index",
+          |lc| lc + next_index.get_variable() + CS::one(),
+          |lc| lc + CS::one(),
+          |lc| lc + index.get_variable(),
+        );
+        Ok(vec![
+          next_intermediate_gamma,
+          gamma.clone(),
+          next_R,
+          next_W,
+          next_rw_counter,
+          next_index,
+        ])
+      }
+    }
+
+    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
+    let (mut circuit_primary, z0_primary) = HeapifyCircuit::new(ro_consts);
+
+    let mut circuit_secondary = TrivialTestCircuit::default();
+
+    // produce public parameters
+    let pp =
+      PublicParams::<G1, G2, HeapifyCircuit<G2>, TrivialTestCircuit<<G2 as Group>::Scalar>>::setup(
+        &circuit_primary,
+        &circuit_secondary,
+        None,
+        None,
+      )
+      .unwrap();
+
+    // 5th is initial index
+    let num_steps = u32::from_le_bytes(z0_primary[5].to_repr()[0..4].try_into().unwrap());
+
+    let z0_secondary = vec![<G2 as Group>::Scalar::ZERO; z0_primary.len()];
+
+    // produce a recursive SNARK
+    let mut recursive_snark: RecursiveSNARK<
+      G1,
+      G2,
+      HeapifyCircuit<G2>,
+      TrivialTestCircuit<<G2 as Group>::Scalar>,
+    > =
+      RecursiveSNARK::<G1, G2, HeapifyCircuit<G2>, TrivialTestCircuit<<G2 as Group>::Scalar>>::new(
+        &pp,
+        &mut circuit_primary,
+        &mut circuit_secondary,
+        z0_primary.clone(),
+        z0_secondary.clone(),
+      );
+
+    for i in (0..num_steps).into_iter() {
+      println!("step i {}", i);
+      let res = recursive_snark.prove_step(
+        &pp,
+        &mut circuit_primary,
+        &mut circuit_secondary.clone(),
+        z0_primary.clone(),
+        z0_secondary.clone(),
+      );
+      assert!(res.is_ok());
+    }
+    // verify the recursive SNARK
+    let res = recursive_snark.verify(&pp, num_steps as usize, &z0_primary, &z0_secondary);
+    assert!(res.is_ok());
+
+    // TODO compression snark
   }
 }

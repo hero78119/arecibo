@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use bellpepper::gadgets::Assignment;
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError};
 
 use crate::constants::NUM_CHALLENGE_BITS;
@@ -7,9 +8,9 @@ use crate::gadgets::nonnative::util::Num;
 use crate::gadgets::utils::alloc_const;
 use crate::traits::ROCircuitTrait;
 use crate::traits::{Group, ROConstantsCircuit};
-use ff::Field;
+use ff::{Field, PrimeField};
 
-use super::utils::{add_allocated_num, alloc_one, conditionally_select2, le_bits_to_num};
+use super::utils::{alloc_one, conditionally_select2, le_bits_to_num};
 
 /// rw trace
 pub enum RWTrace<G: Group> {
@@ -21,13 +22,14 @@ pub enum RWTrace<G: Group> {
 
 /// for starting a transaction
 pub struct LookupTransaction<'a, G: Group> {
-  lookup: &'a mut Lookup<G>,
+  lookup: &'a mut Lookup<G::Base>,
   rw_trace: Vec<RWTrace<G>>,
   map_aux: BTreeMap<G::Base, (G::Base, G::Base)>,
 }
 
 impl<'a, G: Group> LookupTransaction<'a, G> {
-  fn start_transaction(lookup: &'a mut Lookup<G>) -> LookupTransaction<'a, G> {
+  /// start a new transaction
+  pub fn start_transaction(lookup: &'a mut Lookup<G::Base>) -> LookupTransaction<'a, G> {
     LookupTransaction {
       lookup,
       rw_trace: vec![],
@@ -35,7 +37,8 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     }
   }
 
-  fn read<CS: ConstraintSystem<<G as Group>::Base>>(
+  // read value from table
+  pub fn read<CS: ConstraintSystem<<G as Group>::Base>>(
     &mut self,
     mut cs: CS,
     addr: &AllocatedNum<G::Base>,
@@ -43,7 +46,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
   where
     <G as Group>::Base: std::cmp::Ord,
   {
-    let key = &addr.get_value().unwrap();
+    let key = &addr.get_value().unwrap_or_default();
     let (value, _) = self.map_aux.entry(*key).or_insert_with(|| {
       self
         .lookup
@@ -59,7 +62,8 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     Ok(read_value)
   }
 
-  fn write(
+  /// write value to lookup table
+  pub fn write(
     &mut self,
     addr: &AllocatedNum<G::Base>,
     value: &AllocatedNum<G::Base>,
@@ -81,7 +85,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
   }
 
   /// commit rw_trace to lookup
-  fn commit<CS: ConstraintSystem<<G as Group>::Base>>(
+  pub fn commit<CS: ConstraintSystem<<G as Group>::Base>>(
     &mut self,
     mut cs: CS,
     ro_const: ROConstantsCircuit<G>,
@@ -102,7 +106,6 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
   where
     <G as Group>::Base: std::cmp::Ord,
   {
-    // let ro_consts1: ROConstantsCircuit<PastaG2> = PoseidonConstantsCircuit::new();
     let mut ro = G::ROCircuit::new(
       ro_const,
       1 + 3 * self.rw_trace.len(), // prev_challenge + [(address, value, counter)]
@@ -112,17 +115,20 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
       (prev_R.clone(), prev_W.clone(), prev_rw_counter.clone()),
       |(prev_R, prev_W, prev_rw_counter), (i, rwtrace)| match rwtrace {
         RWTrace::Read(addr, read_value) => {
-          let (next_R, next_W, next_rw_counter) = self.lookup.read(
-            cs.namespace(|| format!("{}th read ", i)),
-            true,
-            &mut ro,
-            &addr,
-            gamma,
-            &read_value,
-            &prev_R,
-            &prev_W,
-            &prev_rw_counter,
-          )?;
+          let (next_R, next_W, next_rw_counter, read_value, read_counter) =
+            self.lookup.add_operation(
+              cs.namespace(|| format!("{}th read ", i)),
+              true,
+              &addr,
+              gamma,
+              &read_value,
+              &prev_R,
+              &prev_W,
+              &prev_rw_counter,
+            )?;
+          ro.absorb(&addr);
+          ro.absorb(&read_value);
+          ro.absorb(&read_counter);
           Ok::<
             (
               AllocatedNum<G::Base>,
@@ -133,17 +139,20 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
           >((next_R, next_W, next_rw_counter))
         }
         RWTrace::Write(addr, read_value) => {
-          let (next_R, next_W, next_rw_counter) = self.lookup.read(
-            cs.namespace(|| format!("{}th write ", i)),
-            false,
-            &mut ro,
-            &addr,
-            gamma,
-            &read_value,
-            &prev_R,
-            &prev_W,
-            &prev_rw_counter,
-          )?;
+          let (next_R, next_W, next_rw_counter, read_value, read_counter) =
+            self.lookup.add_operation(
+              cs.namespace(|| format!("{}th write ", i)),
+              false,
+              &addr,
+              gamma,
+              &read_value,
+              &prev_R,
+              &prev_W,
+              &prev_rw_counter,
+            )?;
+          ro.absorb(&addr);
+          ro.absorb(&read_value);
+          ro.absorb(&read_counter);
           Ok::<
             (
               AllocatedNum<G::Base>,
@@ -162,63 +171,66 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
 }
 
 /// Lookup in R1CS
-pub struct Lookup<G: Group> {
-  pub(crate) map_aux: BTreeMap<<G as Group>::Base, (<G as Group>::Base, <G as Group>::Base)>, // (value, counter)
+#[derive(Clone, Debug)]
+pub struct Lookup<F: PrimeField> {
+  pub(crate) map_aux: BTreeMap<F, (F, F)>, // (value, counter)
   /// map_aux_dirty only include the modified fields of `map_aux`, thats why called dirty
-  map_aux_dirty: BTreeMap<G::Base, (G::Base, G::Base)>, // (value, counter)
-  rw_counter: G::Base,
+  map_aux_dirty: BTreeMap<F, (F, F)>, // (value, counter)
+  rw_counter: F,
   rw: bool, // read only or read-write
 }
 
-impl<G: Group> Lookup<G> {
-  fn new(rw: bool, initial_table: Vec<(G::Base, G::Base)>) -> Lookup<G>
+impl<F: PrimeField> Lookup<F> {
+  /// new lookup table
+  pub fn new(rw: bool, initial_table: Vec<(F, F)>) -> Lookup<F>
   where
-    <G as Group>::Base: std::cmp::Ord,
+    F: std::cmp::Ord,
   {
     Self {
       map_aux: initial_table
         .into_iter()
-        .map(|(addr, value)| (addr, (value, G::Base::ZERO)))
+        .map(|(addr, value)| (addr, (value, F::ZERO)))
         .collect(),
       map_aux_dirty: BTreeMap::new(),
-      rw_counter: G::Base::ZERO,
+      rw_counter: F::ZERO,
       rw,
     }
   }
 
-  fn read<CS: ConstraintSystem<<G as Group>::Base>>(
+  fn add_operation<CS: ConstraintSystem<F>>(
     &mut self,
     mut cs: CS,
     is_read: bool,
-    ro: &mut G::ROCircuit,
-    addr: &AllocatedNum<G::Base>,
+    addr: &AllocatedNum<F>,
     // challenges: &(AllocatedNum<G::Base>, AllocatedNum<G::Base>),
-    gamma: &AllocatedNum<G::Base>,
-    external_value: &AllocatedNum<G::Base>,
-    prev_R: &AllocatedNum<G::Base>,
-    prev_W: &AllocatedNum<G::Base>,
-    prev_rw_counter: &AllocatedNum<G::Base>,
+    gamma: &AllocatedNum<F>,
+    external_value: &AllocatedNum<F>,
+    prev_R: &AllocatedNum<F>,
+    prev_W: &AllocatedNum<F>,
+    prev_rw_counter: &AllocatedNum<F>,
   ) -> Result<
     (
-      AllocatedNum<G::Base>,
-      AllocatedNum<G::Base>,
-      AllocatedNum<G::Base>,
+      AllocatedNum<F>,
+      AllocatedNum<F>,
+      AllocatedNum<F>,
+      AllocatedNum<F>,
+      AllocatedNum<F>,
     ),
     SynthesisError,
   >
   where
-    <G as Group>::Base: std::cmp::Ord,
+    F: std::cmp::Ord,
   {
     // extract challenge
     // get content from map
     // value are provided beforehand from outside, therefore here just constraints it
     let (_read_value, _read_counter) = self
       .map_aux
-      .get(&addr.get_value().unwrap())
+      .get(&addr.get_value().unwrap_or_default())
       .cloned()
-      .unwrap_or((G::Base::from(0), G::Base::from(0)));
+      .unwrap_or((F::from(0), F::from(0)));
 
-    let counter = AllocatedNum::alloc(cs.namespace(|| "counter"), || Ok(_read_counter))?;
+    let read_counter = AllocatedNum::alloc(cs.namespace(|| "counter"), || Ok(_read_counter))?;
 
     // external_read_value should match with _read_value
     if is_read {
@@ -232,7 +244,7 @@ impl<G: Group> Lookup<G> {
       assert_eq!(external_rw_counter, self.rw_counter)
     }
 
-    let one = <G as Group>::Base::ONE;
+    let one = F::ONE;
     let neg_one = one.invert().unwrap();
 
     // update R
@@ -245,7 +257,8 @@ impl<G: Group> Lookup<G> {
     };
     let read_value_term = gamma.mul(cs.namespace(|| "read_value_term"), &read_value)?;
     // counter_term = gamma^2 * counter
-    let counter_term = gamma_square.mul(cs.namespace(|| "second_term"), &counter)?;
+    let read_counter_term =
+      gamma_square.mul(cs.namespace(|| "read_counter_term"), &read_counter)?;
     // new_R = R * (gamma - (addr + gamma * value + gamma^2 * counter))
     let new_R = AllocatedNum::alloc(cs.namespace(|| "new_R"), || {
       prev_R
@@ -253,18 +266,18 @@ impl<G: Group> Lookup<G> {
         .zip(gamma.get_value())
         .zip(addr.get_value())
         .zip(read_value_term.get_value())
-        .zip(counter_term.get_value())
+        .zip(read_counter_term.get_value())
         .map(|((((R, gamma), addr), value_term), counter_term)| {
           R * (gamma - (addr + value_term + counter_term))
         })
         .ok_or(SynthesisError::AssignmentMissing)
     })?;
-    let mut r_blc = LinearCombination::<G::Base>::zero();
+    let mut r_blc = LinearCombination::<F>::zero();
     r_blc = r_blc
       + (one, gamma.get_variable())
       + (neg_one, addr.get_variable())
       + (neg_one, read_value_term.get_variable())
-      + (neg_one, counter_term.get_variable());
+      + (neg_one, read_counter_term.get_variable());
     cs.enforce(
       || "R update",
       |lc| lc + (one, prev_R.get_variable()),
@@ -274,9 +287,9 @@ impl<G: Group> Lookup<G> {
 
     // RO to get challenge
     // where the input only cover
-    ro.absorb(addr);
-    ro.absorb(&read_value);
-    ro.absorb(&counter);
+    // ro.absorb(addr);
+    // ro.absorb(&read_value);
+    // ro.absorb(&read_counter);
 
     let alloc_num_one = alloc_one(cs.namespace(|| "one"))?;
 
@@ -285,9 +298,9 @@ impl<G: Group> Lookup<G> {
     let (write_counter, write_counter_term) = if self.rw {
       // write_counter = read_counter < prev_rw_counter ? prev_rw_counter: read_counter
       // TODO optimise with `max` table lookup to save more constraints
-      let lt = less_than::<G, _>(
+      let lt = less_than(
         cs.namespace(|| "read_counter < a"),
-        &counter,
+        &read_counter,
         prev_rw_counter,
         12, // TODO configurable n_bit
       )?;
@@ -296,14 +309,14 @@ impl<G: Group> Lookup<G> {
           "write_counter = read_counter < prev_rw_counter ? prev_rw_counter: read_counter"
         }),
         prev_rw_counter,
-        &counter,
+        &read_counter,
         &lt,
       )?;
       let write_counter_term =
         gamma_square.mul(cs.namespace(|| "write_counter_term"), &write_counter)?;
       (write_counter, write_counter_term)
     } else {
-      (counter, counter_term)
+      (read_counter.clone(), read_counter_term)
     };
 
     // update W
@@ -329,7 +342,7 @@ impl<G: Group> Lookup<G> {
         .ok_or(SynthesisError::AssignmentMissing)
     })?;
     // new_W = W * (gamma - (addr + gamma * value + gamma^2 * counter + gamma^2)))
-    let mut w_blc = LinearCombination::<G::Base>::zero();
+    let mut w_blc = LinearCombination::<F>::zero();
     w_blc = w_blc
       + (one, gamma.get_variable())
       + (neg_one, addr.get_variable())
@@ -366,26 +379,41 @@ impl<G: Group> Lookup<G> {
     if let Some(new_rw_counter) = new_rw_counter.get_value() {
       self.rw_counter = new_rw_counter;
     }
-    Ok((new_R, new_W, new_rw_counter))
+    Ok((new_R, new_W, new_rw_counter, read_value, read_counter))
   }
 
   // fn write(&mut self, addr: AllocatedNum<F>, value: F) {}
 }
 
-// a < b ? 1 : 0
-fn less_than<G: Group, CS: ConstraintSystem<G::Base>>(
+/// c = a + b where a, b is AllocatedNum
+pub fn add_allocated_num<F: PrimeField, CS: ConstraintSystem<F>>(
   mut cs: CS,
-  a: &AllocatedNum<G::Base>,
-  b: &AllocatedNum<G::Base>,
+  a: &AllocatedNum<F>,
+  b: &AllocatedNum<F>,
+) -> Result<AllocatedNum<F>, SynthesisError> {
+  let c = AllocatedNum::alloc(cs.namespace(|| "c"), || {
+    Ok(*a.get_value().get()? + b.get_value().get()?)
+  })?;
+  cs.enforce(
+    || "c = a+b",
+    |lc| lc + a.get_variable() + b.get_variable(),
+    |lc| lc + CS::one(),
+    |lc| lc + c.get_variable(),
+  );
+  Ok(c)
+}
+
+/// a < b ? 1 : 0
+pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
+  mut cs: CS,
+  a: &AllocatedNum<F>,
+  b: &AllocatedNum<F>,
   n_bits: usize,
-) -> Result<AllocatedNum<G::Base>, SynthesisError>
-where
-  <G as Group>::Base: PartialOrd,
-{
+) -> Result<AllocatedNum<F>, SynthesisError> {
   assert!(n_bits < 64, "not support n_bits {n_bits} >= 64");
   let range = alloc_const(
     cs.namespace(|| "range"),
-    G::Base::from(2_usize.pow(n_bits as u32) as u64),
+    F::from(2_usize.pow(n_bits as u32) as u64),
   )?;
   let diff = Num::alloc(cs.namespace(|| "diff"), || {
     a.get_value()
@@ -393,7 +421,7 @@ where
       .zip(range.get_value())
       .map(|((a, b), range)| {
         let lt = a < b;
-        (a - b) + (if lt { range } else { G::Base::ZERO })
+        (a - b) + (if lt { range } else { F::ZERO })
       })
       .ok_or(SynthesisError::AssignmentMissing)
   })?;
@@ -401,7 +429,7 @@ where
   let lt = AllocatedNum::alloc(cs.namespace(|| "lt"), || {
     a.get_value()
       .zip(b.get_value())
-      .map(|(a, b)| G::Base::from((a < b) as u64))
+      .map(|(a, b)| F::from((a < b) as u64))
       .ok_or(SynthesisError::AssignmentMissing)
   })?;
   cs.enforce(
@@ -414,7 +442,7 @@ where
     || "lt ⋅ range == diff - lhs + rhs",
     |lc| lc + lt.get_variable(),
     |lc| lc + range.get_variable(),
-    |_| diff.num + (G::Base::ONE.invert().unwrap(), a.get_variable()) + b.get_variable(),
+    |_| diff.num + (F::ONE.invert().unwrap(), a.get_variable()) + b.get_variable(),
   );
   Ok(lt)
 }
@@ -434,7 +462,6 @@ mod test {
   use ff::Field;
 
   use super::Lookup;
-  use crate::traits::ROConstantsTrait;
   use crate::traits::ROTrait;
   use bellpepper_core::{num::AllocatedNum, test_cs::TestConstraintSystem, ConstraintSystem};
 
@@ -443,7 +470,7 @@ mod test {
     type G1 = pasta_curves::pallas::Point;
     type G2 = pasta_curves::vesta::Point;
 
-    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::new();
+    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
 
     let mut cs = TestConstraintSystem::<<G1 as Group>::Scalar>::new();
     // let mut cs: TestShapeCS<G1> = TestShapeCS::new();
@@ -454,8 +481,8 @@ mod test {
       ),
       (<G1 as Group>::Scalar::ONE, <G1 as Group>::Scalar::ZERO),
     ];
-    let mut lookup = Lookup::<G2>::new(false, initial_table);
-    let mut lookup_transaction = LookupTransaction::start_transaction(&mut lookup);
+    let mut lookup = Lookup::<<G1 as Group>::Scalar>::new(false, initial_table);
+    let mut lookup_transaction = LookupTransaction::<G2>::start_transaction(&mut lookup);
     let gamma = AllocatedNum::alloc(cs.namespace(|| "gamma"), || {
       Ok(<G1 as Group>::Scalar::from(2))
     })
@@ -549,7 +576,7 @@ mod test {
     type G1 = pasta_curves::pallas::Point;
     type G2 = pasta_curves::vesta::Point;
 
-    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::new();
+    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
 
     let mut cs = TestConstraintSystem::<<G1 as Group>::Scalar>::new();
     // let mut cs: TestShapeCS<G1> = TestShapeCS::new();
@@ -557,8 +584,8 @@ mod test {
       (<G1 as Group>::Scalar::ZERO, <G1 as Group>::Scalar::ZERO),
       (<G1 as Group>::Scalar::ONE, <G1 as Group>::Scalar::ZERO),
     ];
-    let mut lookup = Lookup::<G2>::new(true, initial_table);
-    let mut lookup_transaction = LookupTransaction::start_transaction(&mut lookup);
+    let mut lookup = Lookup::<<G1 as Group>::Scalar>::new(true, initial_table);
+    let mut lookup_transaction = LookupTransaction::<G2>::start_transaction(&mut lookup);
     let gamma = AllocatedNum::alloc(cs.namespace(|| "gamma"), || {
       Ok(<G1 as Group>::Scalar::from(2))
     })
