@@ -325,7 +325,10 @@ where
       .expect("Nova error synthesis");
     let (u_primary, w_primary) = cs_primary
       .r1cs_instance_and_witness(&pp.r1cs_shape_primary, &pp.ck_primary)
-      .map_err(|_e| NovaError::UnSat)
+      .map_err(|_e| {
+        println!("error {:?}", _e);
+        NovaError::UnSat
+      })
       .expect("Nova error unsat");
 
     // base case for the secondary
@@ -412,6 +415,7 @@ where
     z0_secondary: Vec<G2::Scalar>,
   ) -> Result<(), NovaError> {
     if z0_primary.len() != pp.F_arity_primary || z0_secondary.len() != pp.F_arity_secondary {
+      println!("z0_primary.len() {}, pp.F_arity_primary {}, z0_secondary.len() {}, pp.F_arity_secondary {}", z0_primary.len(), pp.F_arity_primary, z0_secondary.len(), pp.F_arity_secondary);
       return Err(NovaError::InvalidInitialInputLength);
     }
 
@@ -905,13 +909,18 @@ type CompressedCommitment<G> = <<<G as Group>::CE as CommitmentEngineTrait<G>>::
 type CE<G> = <G as Group>::CE;
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-  use crate::gadgets::lookup::{less_than, Lookup, LookupTransaction};
-  use crate::gadgets::utils::{alloc_const, conditionally_select2};
+  use crate::bellpepper::test_shape_cs::TestShapeCS;
+  use crate::gadgets::lookup::{
+    less_than, Lookup, LookupTransaction, LookupTransactionSimulate, TableType,
+  };
+  use crate::gadgets::utils::{alloc_const, alloc_one, conditionally_select2};
   use crate::provider::bn256_grumpkin::{bn256, grumpkin};
   use crate::provider::pedersen::CommitmentKeyExtTrait;
   use crate::provider::poseidon::PoseidonConstantsCircuit;
   use crate::provider::secp_secq::{secp256k1, secq256k1};
+  use crate::spartan::math::Math;
 
   use super::*;
   type EE1<G1> = provider::ipa_pc::EvaluationEngine<G1>;
@@ -921,9 +930,11 @@ mod tests {
   type S1Prime<G1> = spartan::ppsnark::RelaxedR1CSSNARK<G1, EE1<G1>>;
   type S2Prime<G2> = spartan::ppsnark::RelaxedR1CSSNARK<G2, EE2<G2>>;
 
+  use ::bellpepper::gadgets::lookup;
   use ::bellpepper_core::{num::AllocatedNum, ConstraintSystem, SynthesisError};
   use core::marker::PhantomData;
   use ff::PrimeField;
+  use tap::TapOptional;
   use traits::circuit::TrivialTestCircuit;
 
   #[derive(Clone, Debug, Default)]
@@ -1625,7 +1636,40 @@ mod tests {
     test_ivc_base_with::<secp256k1::Point, secq256k1::Point>();
   }
 
+  fn print_constraints_name_on_error_index<G1, G2, C1, C2>(err: &NovaError, mut c_primary: C1)
+  where
+    G1: Group<Base = <G2 as Group>::Scalar>,
+    G2: Group<Base = <G1 as Group>::Scalar>,
+    C1: StepCircuit<G1::Scalar>,
+    C2: StepCircuit<G2::Scalar>,
+  {
+    match err {
+      NovaError::UnSatIndex(index) => {
+        let augmented_circuit_params_primary =
+          NovaAugmentedCircuitParams::new(BN_LIMB_WIDTH, BN_N_LIMBS, true);
+
+        // let (mut circuit_primary, z0_primary) = HeapifyCircuit::new(ro_consts);
+        let ro_consts_circuit_primary: ROConstantsCircuit<G2> = ROConstantsCircuit::<G2>::default();
+        let circuit_primary: NovaAugmentedCircuit<'_, G2, C1> = NovaAugmentedCircuit::new(
+          &augmented_circuit_params_primary,
+          None,
+          &mut c_primary,
+          ro_consts_circuit_primary.clone(),
+        );
+        // let mut cs: ShapeCS<G1> = ShapeCS::new();
+        // let _ = circuit_primary.synthesize(&mut cs);
+        let mut cs: TestShapeCS<G1> = TestShapeCS::new();
+        let _ = circuit_primary.synthesize(&mut cs);
+        cs.constraints
+          .get(*index)
+          .tap_some(|constraint| println!("failed at constraint {}", constraint.3));
+      }
+      error => unimplemented!("{:?}", error),
+    }
+  }
+
   #[test]
+  #[allow(dead_code)]
   fn test_ivc_rwlookup() {
     type G1 = pasta_curves::pallas::Point;
     type G2 = pasta_curves::vesta::Point;
@@ -1641,33 +1685,31 @@ mod tests {
     where
       <G as traits::Group>::Base: std::cmp::Ord,
     {
-      fn new(ro_consts: ROConstantsCircuit<G>) -> (Self, Vec<G::Base>) {
-        let initial_table = (0..64)
+      fn new(heap_size: usize, ro_consts: ROConstantsCircuit<G>) -> (Self, Vec<G::Base>) {
+        let n = heap_size; // assume complement binary tree
+        let initial_table = (0..n - 1)
           .map(|i| {
             (
-              <G as Group>::Base::from(i),
-              <G as Group>::Base::from(63 - i),
+              <G as Group>::Base::from(i as u64),
+              <G as Group>::Base::from((n - 2 - i) as u64),
             )
           })
           .collect();
-        let lookup = Lookup::new(true, initial_table);
-        // TODO compute global challenge `gamma` by simulating rw trace
-        let gamma = G::Base::from(3);
+        let lookup = Lookup::new(n * 4, TableType::ReadWrite, initial_table);
 
-        let (
-          initial_intermediate_gamma,
-          gamma,
-          init_prev_R,
-          init_prev_W,
-          init_rw_counter,
-          initial_index,
-        ) = (
+        let (initial_intermediate_gamma, init_prev_R, init_prev_W, init_rw_counter, initial_index) = (
           G::Base::from(1),
-          gamma,
           G::Base::from(1),
           G::Base::from(1),
           G::Base::from(0),
-          G::Base::from(31),
+          G::Base::from(((n - 4) / 2) as u64),
+        );
+
+        // TODO challenge should include final table (final table values + counters) commitment
+        let gamma = Self::pre_compute_global_challenge(
+          initial_intermediate_gamma,
+          ((n - 4) / 2) as usize,
+          &lookup,
         );
 
         (
@@ -1681,6 +1723,39 @@ mod tests {
             initial_index,
           ],
         )
+      }
+
+      // pre-compute challenge before folding steps
+      // NOTE: challenge validation will be defered to CompressSNARK
+      fn pre_compute_global_challenge(
+        initial_intermediate_gamma: G::Base,
+        initial_index: usize,
+        lookup: &Lookup<G::Base>,
+      ) -> G::Base {
+        let ro_consts =
+        <<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants::default();
+
+        let mut lookup = lookup.clone();
+        let num_steps = initial_index;
+        let mut intermediate_gamma = initial_intermediate_gamma;
+        // simulate folding step lookup io
+        for i in (0..num_steps + 1).into_iter() {
+          let mut lookup_transaction =
+            LookupTransactionSimulate::<G>::start_transaction(&mut lookup);
+          let addr = G::Base::from((num_steps - i) as u64);
+          let parent = lookup_transaction.read(addr);
+          let left_child = lookup_transaction.read(G::Base::from(2) * addr + G::Base::ONE);
+          let right_child = lookup_transaction.read(G::Base::from(2) * addr + G::Base::from(2));
+          let tmp = if left_child < parent {
+            left_child
+          } else {
+            parent
+          };
+          let tmp = if right_child < tmp { right_child } else { tmp };
+          lookup_transaction.write(addr, tmp);
+          intermediate_gamma = lookup_transaction.commit(ro_consts.clone(), intermediate_gamma)
+        }
+        intermediate_gamma
       }
     }
 
@@ -1705,8 +1780,18 @@ mod tests {
         let prev_rw_counter = &z[4];
         let index = &z[5];
 
-        let two = alloc_const(cs.namespace(|| "2"), F::from(2))?;
-        let left_child_index = index.mul(cs.namespace(|| "left_child_index"), &two)?;
+        let left_child_index = AllocatedNum::alloc(cs.namespace(|| "left_child_index"), || {
+          index
+            .get_value()
+            .map(|i| i.mul(F::from(2)) + F::ONE)
+            .ok_or(SynthesisError::AssignmentMissing)
+        })?;
+        cs.enforce(
+          || "(2*index + 1) * 1 = left_child_index",
+          |lc| lc + (F::from(2), index.get_variable()) + CS::one(),
+          |lc| lc + CS::one(),
+          |lc| lc + left_child_index.get_variable(),
+        );
         let right_child_index = AllocatedNum::alloc(cs.namespace(|| "right_child_index"), || {
           left_child_index
             .get_value()
@@ -1790,8 +1875,12 @@ mod tests {
       }
     }
 
+    let heap_size = 16;
+
     let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
-    let (mut circuit_primary, z0_primary) = HeapifyCircuit::new(ro_consts);
+    let (mut circuit_primary, z0_primary) = HeapifyCircuit::new(heap_size, ro_consts);
+    // let mut circuit_primary = TrivialTestCircuit::default();
+    // let z0_primary = vec![<G1 as Group>::Scalar::ZERO; 6];
 
     let mut circuit_secondary = TrivialTestCircuit::default();
 
@@ -1805,10 +1894,11 @@ mod tests {
       )
       .unwrap();
 
-    // 5th is initial index
-    let num_steps = u32::from_le_bytes(z0_primary[5].to_repr()[0..4].try_into().unwrap());
+    // 5th is initial index.
+    // +1 for index end with 0
+    let num_steps = u32::from_le_bytes(z0_primary[5].to_repr()[0..4].try_into().unwrap()) + 1;
 
-    let z0_secondary = vec![<G2 as Group>::Scalar::ZERO; z0_primary.len()];
+    let z0_secondary = vec![<G2 as Group>::Scalar::ZERO; 1];
 
     // produce a recursive SNARK
     let mut recursive_snark: RecursiveSNARK<
@@ -1816,14 +1906,13 @@ mod tests {
       G2,
       HeapifyCircuit<G2>,
       TrivialTestCircuit<<G2 as Group>::Scalar>,
-    > =
-      RecursiveSNARK::<G1, G2, HeapifyCircuit<G2>, TrivialTestCircuit<<G2 as Group>::Scalar>>::new(
-        &pp,
-        &mut circuit_primary,
-        &mut circuit_secondary,
-        z0_primary.clone(),
-        z0_secondary.clone(),
-      );
+    > = RecursiveSNARK::new(
+      &pp,
+      &mut circuit_primary,
+      &mut circuit_secondary,
+      z0_primary.clone(),
+      z0_secondary.clone(),
+    );
 
     for i in (0..num_steps).into_iter() {
       println!("step i {}", i);
@@ -1834,12 +1923,48 @@ mod tests {
         z0_primary.clone(),
         z0_secondary.clone(),
       );
+      res
+        .clone()
+        .map_err(|err| println!("err {:?}", err))
+        .unwrap();
       assert!(res.is_ok());
     }
     // verify the recursive SNARK
     let res = recursive_snark.verify(&pp, num_steps as usize, &z0_primary, &z0_secondary);
+    res
+      .clone()
+      .map_err(|err| {
+        print_constraints_name_on_error_index::<
+          G1,
+          G2,
+          HeapifyCircuit<G2>,
+          TrivialTestCircuit<<G2 as Group>::Scalar>,
+        >(&err, circuit_primary.clone())
+      })
+      .unwrap();
     assert!(res.is_ok());
+    /*
+       let next_gamma = &z[0];
+       let gamma = &z[1];
+       let next_R = &z[2];
+       let next_W = &z[3];
+       let next_rw_counter = &z[4];
+       let next_index = &z[5];
+    */
+    let (zn_primary, _) = res.unwrap();
 
+    // TODO remove below check since challenge need to include table commitment
+    assert_eq!(zn_primary[0], zn_primary[1]); // challenge == pre_compute_challenge
+
+    assert_eq!(<G1 as Group>::Scalar::from(1).neg(), zn_primary[5]); // last index == -1
+
+    let number_of_iterated_nodes = (heap_size - 4) / 2 + 1;
+    assert_eq!(
+      <G1 as Group>::Scalar::from((number_of_iterated_nodes * 4) as u64),
+      zn_primary[4]
+    ); // rw counter = number_of_iterated_nodes * (3r + 1w) operations
+
+    println!("zn_primary {:?}", zn_primary);
     // TODO compression snark
   }
 }

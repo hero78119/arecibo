@@ -1,3 +1,5 @@
+//! This module implements lookup gadget for applications built with Nova.
+use std::cmp::max;
 use std::collections::BTreeMap;
 
 use bellpepper::gadgets::Assignment;
@@ -6,24 +8,107 @@ use bellpepper_core::{num::AllocatedNum, ConstraintSystem, LinearCombination, Sy
 use crate::constants::NUM_CHALLENGE_BITS;
 use crate::gadgets::nonnative::util::Num;
 use crate::gadgets::utils::alloc_const;
+use crate::spartan::math::Math;
 use crate::traits::ROCircuitTrait;
+use crate::traits::ROConstants;
+use crate::traits::ROTrait;
 use crate::traits::{Group, ROConstantsCircuit};
 use ff::{Field, PrimeField};
 
+use super::utils::scalar_as_base;
 use super::utils::{alloc_one, conditionally_select2, le_bits_to_num};
 
 /// rw trace
-pub enum RWTrace<G: Group> {
+pub enum RWTrace<T> {
   /// read
-  Read(AllocatedNum<G::Base>, AllocatedNum<G::Base>),
+  Read(T, T),
   /// write
-  Write(AllocatedNum<G::Base>, AllocatedNum<G::Base>),
+  Write(T, T),
+}
+
+/// Lookup in R1CS
+#[derive(Clone, Debug, PartialEq)]
+pub enum TableType {
+  /// read only
+  ReadOnly,
+  /// write
+  ReadWrite,
+}
+
+/// for starting a transaction simulation
+pub struct LookupTransactionSimulate<'a, G: Group> {
+  lookup: &'a mut Lookup<G::Base>,
+  rw_trace: Vec<RWTrace<G::Base>>,
+  map_aux: BTreeMap<G::Base, (G::Base, G::Base)>,
+}
+
+impl<'a, G: Group> LookupTransactionSimulate<'a, G> {
+  /// start a new transaction simulated
+  pub fn start_transaction(lookup: &'a mut Lookup<G::Base>) -> LookupTransactionSimulate<'a, G> {
+    LookupTransactionSimulate {
+      lookup,
+      rw_trace: vec![],
+      map_aux: BTreeMap::new(),
+    }
+  }
+
+  /// read value from table
+  pub fn read(&mut self, addr: G::Base) -> G::Base
+  where
+    <G as Group>::Base: std::cmp::Ord,
+  {
+    let key = &addr;
+    let (value, _) = self.map_aux.entry(*key).or_insert_with(|| {
+      self
+        .lookup
+        .map_aux
+        .get(key)
+        .cloned()
+        .unwrap_or_else(|| (G::Base::from(0), G::Base::from(0)))
+    });
+    self.rw_trace.push(RWTrace::Read(addr, *value)); // append read trace
+    *value
+  }
+  /// write value to lookup table
+  pub fn write(&mut self, addr: G::Base, value: G::Base)
+  where
+    <G as Group>::Base: std::cmp::Ord,
+  {
+    let _ = self.map_aux.insert(
+      addr,
+      (
+        value,
+        G::Base::ZERO, // zero counter doens't matter, real counter will be computed inside lookup table
+      ),
+    );
+    self.rw_trace.push(RWTrace::Write(addr, value)); // append read trace
+  }
+  /// commit rw_trace to lookup
+  pub fn commit(&mut self, ro_consts: ROConstants<G>, prev_intermediate_gamma: G::Base) -> G::Base
+  where
+    <G as Group>::Base: std::cmp::Ord,
+  {
+    let mut hasher = <G as Group>::RO::new(ro_consts, 1 + self.rw_trace.len() * 3);
+    hasher.absorb(prev_intermediate_gamma);
+
+    self.rw_trace.iter().for_each(|rwtrace| {
+      let (addr, (read_value, read_counter)) = match rwtrace {
+        RWTrace::Read(addr, value) => (addr, self.lookup.rw_operation(true, *addr, *value)),
+        RWTrace::Write(addr, value) => (addr, self.lookup.rw_operation(false, *addr, *value)),
+      };
+      hasher.absorb(*addr);
+      hasher.absorb(read_value);
+      hasher.absorb(read_counter);
+    });
+    let hash_bits = hasher.squeeze(NUM_CHALLENGE_BITS);
+    scalar_as_base::<G>(hash_bits)
+  }
 }
 
 /// for starting a transaction
 pub struct LookupTransaction<'a, G: Group> {
   lookup: &'a mut Lookup<G::Base>,
-  rw_trace: Vec<RWTrace<G>>,
+  rw_trace: Vec<RWTrace<AllocatedNum<G::Base>>>,
   map_aux: BTreeMap<G::Base, (G::Base, G::Base)>,
 }
 
@@ -37,7 +122,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     }
   }
 
-  // read value from table
+  /// read value from table
   pub fn read<CS: ConstraintSystem<<G as Group>::Base>>(
     &mut self,
     mut cs: CS,
@@ -56,9 +141,10 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
         .unwrap_or_else(|| (G::Base::from(0), G::Base::from(0)))
     });
     let read_value = AllocatedNum::alloc(cs.namespace(|| "read_value"), || Ok(*value))?;
-    self
-      .rw_trace
-      .push(RWTrace::Read(addr.clone(), read_value.clone())); // append read trace
+    self.rw_trace.push(RWTrace::Read::<AllocatedNum<G::Base>>(
+      addr.clone(),
+      read_value.clone(),
+    )); // append read trace
     Ok(read_value)
   }
 
@@ -72,9 +158,9 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     <G as Group>::Base: std::cmp::Ord,
   {
     let _ = self.map_aux.insert(
-      addr.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+      addr.get_value().unwrap_or_default(),
       (
-        value.get_value().ok_or(SynthesisError::AssignmentMissing)?,
+        value.get_value().unwrap_or_default(),
         G::Base::ZERO, // zero counter doens't matter, real counter will be computed inside lookup table
       ),
     );
@@ -85,6 +171,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
   }
 
   /// commit rw_trace to lookup
+  #[allow(clippy::too_many_arguments)]
   pub fn commit<CS: ConstraintSystem<<G as Group>::Base>>(
     &mut self,
     mut cs: CS,
@@ -116,17 +203,17 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
       |(prev_R, prev_W, prev_rw_counter), (i, rwtrace)| match rwtrace {
         RWTrace::Read(addr, read_value) => {
           let (next_R, next_W, next_rw_counter, read_value, read_counter) =
-            self.lookup.add_operation(
+            self.lookup.rw_operation_circuit(
               cs.namespace(|| format!("{}th read ", i)),
               true,
-              &addr,
+              addr,
               gamma,
-              &read_value,
+              read_value,
               &prev_R,
               &prev_W,
               &prev_rw_counter,
             )?;
-          ro.absorb(&addr);
+          ro.absorb(addr);
           ro.absorb(&read_value);
           ro.absorb(&read_counter);
           Ok::<
@@ -138,19 +225,19 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
             SynthesisError,
           >((next_R, next_W, next_rw_counter))
         }
-        RWTrace::Write(addr, read_value) => {
+        RWTrace::Write(addr, write_value) => {
           let (next_R, next_W, next_rw_counter, read_value, read_counter) =
-            self.lookup.add_operation(
+            self.lookup.rw_operation_circuit(
               cs.namespace(|| format!("{}th write ", i)),
               false,
-              &addr,
+              addr,
               gamma,
-              &read_value,
+              write_value,
               &prev_R,
               &prev_W,
               &prev_rw_counter,
             )?;
-          ro.absorb(&addr);
+          ro.absorb(addr);
           ro.absorb(&read_value);
           ro.absorb(&read_counter);
           Ok::<
@@ -177,15 +264,21 @@ pub struct Lookup<F: PrimeField> {
   /// map_aux_dirty only include the modified fields of `map_aux`, thats why called dirty
   map_aux_dirty: BTreeMap<F, (F, F)>, // (value, counter)
   rw_counter: F,
-  rw: bool, // read only or read-write
+  table_type: TableType,         // read only or read-write
+  max_cap_rwcounter_log2: usize, // max cap for rw_counter operation in bits
 }
 
 impl<F: PrimeField> Lookup<F> {
   /// new lookup table
-  pub fn new(rw: bool, initial_table: Vec<(F, F)>) -> Lookup<F>
+  pub fn new(
+    max_cap_rwcounter: usize,
+    table_type: TableType,
+    initial_table: Vec<(F, F)>,
+  ) -> Lookup<F>
   where
     F: std::cmp::Ord,
   {
+    let max_cap_rwcounter_log2 = max_cap_rwcounter.log_2();
     Self {
       map_aux: initial_table
         .into_iter()
@@ -193,11 +286,43 @@ impl<F: PrimeField> Lookup<F> {
         .collect(),
       map_aux_dirty: BTreeMap::new(),
       rw_counter: F::ZERO,
-      rw,
+      table_type,
+      max_cap_rwcounter_log2,
     }
   }
 
-  fn add_operation<CS: ConstraintSystem<F>>(
+  fn rw_operation(&mut self, is_read: bool, addr: F, external_value: F) -> (F, F)
+  where
+    F: std::cmp::Ord,
+  {
+    // write operations
+    if !is_read {
+      debug_assert!(self.table_type == TableType::ReadWrite) // table need to set as rw
+    }
+    let (_read_value, _read_counter) = self
+      .map_aux
+      .get(&addr)
+      .cloned()
+      .unwrap_or((F::from(0), F::from(0)));
+
+    let (write_value, write_counter) = (
+      if is_read { _read_value } else { external_value },
+      if self.table_type == TableType::ReadOnly {
+        _read_counter
+      } else {
+        max(self.rw_counter, _read_counter)
+      } + F::ONE,
+    );
+    self.map_aux.insert(addr, (write_value, write_counter));
+    self
+      .map_aux_dirty
+      .insert(addr, (write_value, write_counter));
+    self.rw_counter = write_counter;
+    (_read_value, _read_counter)
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  fn rw_operation_circuit<CS: ConstraintSystem<F>>(
     &mut self,
     mut cs: CS,
     is_read: bool,
@@ -245,7 +370,6 @@ impl<F: PrimeField> Lookup<F> {
     }
 
     let one = F::ONE;
-    let neg_one = one.invert().unwrap();
 
     // update R
     let gamma_square = gamma.mul(cs.namespace(|| "gamme^2"), gamma)?;
@@ -273,16 +397,15 @@ impl<F: PrimeField> Lookup<F> {
         .ok_or(SynthesisError::AssignmentMissing)
     })?;
     let mut r_blc = LinearCombination::<F>::zero();
-    r_blc = r_blc
-      + (one, gamma.get_variable())
-      + (neg_one, addr.get_variable())
-      + (neg_one, read_value_term.get_variable())
-      + (neg_one, read_counter_term.get_variable());
+    r_blc = r_blc + gamma.get_variable()
+      - addr.get_variable()
+      - read_value_term.get_variable()
+      - read_counter_term.get_variable();
     cs.enforce(
       || "R update",
-      |lc| lc + (one, prev_R.get_variable()),
+      |lc| lc + prev_R.get_variable(),
       |_| r_blc,
-      |lc| lc + (one, new_R.get_variable()),
+      |lc| lc + new_R.get_variable(),
     );
 
     // RO to get challenge
@@ -293,16 +416,19 @@ impl<F: PrimeField> Lookup<F> {
 
     let alloc_num_one = alloc_one(cs.namespace(|| "one"))?;
 
-    // max{c, ts} + 1 logic on read-write lookup
-    // c + 1 on read-only
-    let (write_counter, write_counter_term) = if self.rw {
+    // max{read_counter, rw_counter} logic on read-write lookup
+    // read_counter on read-only
+    // - max{read_counter, rw_counter} if read-write table
+    // - read_counter if read-only table
+    // +1 will be hadle later
+    let (write_counter, write_counter_term) = if self.table_type == TableType::ReadWrite {
       // write_counter = read_counter < prev_rw_counter ? prev_rw_counter: read_counter
       // TODO optimise with `max` table lookup to save more constraints
       let lt = less_than(
         cs.namespace(|| "read_counter < a"),
         &read_counter,
         prev_rw_counter,
-        12, // TODO configurable n_bit
+        self.max_cap_rwcounter_log2,
       )?;
       let write_counter = conditionally_select2(
         cs.namespace(|| {
@@ -343,32 +469,31 @@ impl<F: PrimeField> Lookup<F> {
     })?;
     // new_W = W * (gamma - (addr + gamma * value + gamma^2 * counter + gamma^2)))
     let mut w_blc = LinearCombination::<F>::zero();
-    w_blc = w_blc
-      + (one, gamma.get_variable())
-      + (neg_one, addr.get_variable())
-      + (neg_one, write_value_term.get_variable())
-      + (neg_one, write_counter_term.get_variable())
-      + (neg_one, gamma_square.get_variable());
+    w_blc = w_blc + gamma.get_variable()
+      - addr.get_variable()
+      - write_value_term.get_variable()
+      - write_counter_term.get_variable()
+      - gamma_square.get_variable();
     cs.enforce(
       || "W update",
-      |lc| lc + (one, prev_W.get_variable()),
+      |lc| lc + prev_W.get_variable(),
       |_| w_blc,
-      |lc| lc + (one, new_W.get_variable()),
+      |lc| lc + new_W.get_variable(),
     );
 
     // update witness
     self.map_aux.insert(
-      addr.get_value().unwrap(),
+      addr.get_value().unwrap_or_default(),
       (
         external_value.get_value().unwrap_or_default(),
-        write_counter.get_value().unwrap() + one,
+        write_counter.get_value().unwrap_or_default() + one,
       ),
     );
     self.map_aux_dirty.insert(
-      addr.get_value().unwrap(),
+      addr.get_value().unwrap_or_default(),
       (
         external_value.get_value().unwrap_or_default(),
-        write_counter.get_value().unwrap() + one,
+        write_counter.get_value().unwrap_or_default() + one,
       ),
     );
     let new_rw_counter = add_allocated_num(
@@ -415,6 +540,7 @@ pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
     cs.namespace(|| "range"),
     F::from(2_usize.pow(n_bits as u32) as u64),
   )?;
+  // diff = (lhs - rhs) + (if lt { range } else { 0 });
   let diff = Num::alloc(cs.namespace(|| "diff"), || {
     a.get_value()
       .zip(b.get_value())
@@ -426,6 +552,7 @@ pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
       .ok_or(SynthesisError::AssignmentMissing)
   })?;
   diff.fits_in_bits(cs.namespace(|| "diff fit in bits"), n_bits)?;
+  let diff = diff.as_allocated_num(cs.namespace(|| "diff_alloc_num"))?;
   let lt = AllocatedNum::alloc(cs.namespace(|| "lt"), || {
     a.get_value()
       .zip(b.get_value())
@@ -438,11 +565,30 @@ pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
     |lc| lc + CS::one() - lt.get_variable(),
     |lc| lc,
   );
+  // println!(
+  //   "a {:?}, b {:?}, diff {:?}, range {:?}, lt {:?}",
+  //   a.get_value(),
+  //   b.get_value(),
+  //   diff.get_value(),
+  //   range.get_value(),
+  //   lt.get_value(),
+  // );
+  // println!(
+  //   "{:?} =  {:?}",
+  //   lt.get_value()
+  //     .zip(range.get_value())
+  //     .map(|(lt, range)| lt * range),
+  //   diff
+  //     .get_value()
+  //     .zip(a.get_value())
+  //     .zip(b.get_value())
+  //     .map(|((diff, a), b)| diff - a + b),
+  // );
   cs.enforce(
     || "lt ⋅ range == diff - lhs + rhs",
     |lc| lc + lt.get_variable(),
     |lc| lc + range.get_variable(),
-    |_| diff.num + (F::ONE.invert().unwrap(), a.get_variable()) + b.get_variable(),
+    |lc| lc + diff.get_variable() - a.get_variable() + b.get_variable(),
   );
   Ok(lt)
 }
@@ -453,7 +599,7 @@ mod test {
     // bellpepper::test_shape_cs::TestShapeCS,
     constants::NUM_CHALLENGE_BITS,
     gadgets::{
-      lookup::LookupTransaction,
+      lookup::{LookupTransaction, LookupTransactionSimulate, TableType},
       utils::{alloc_one, alloc_zero, scalar_as_base},
     },
     provider::poseidon::PoseidonConstantsCircuit,
@@ -464,6 +610,54 @@ mod test {
   use super::Lookup;
   use crate::traits::ROTrait;
   use bellpepper_core::{num::AllocatedNum, test_cs::TestConstraintSystem, ConstraintSystem};
+
+  #[test]
+  fn test_lookup_simulation() {
+    type G1 = pasta_curves::pallas::Point;
+    type G2 = pasta_curves::vesta::Point;
+
+    let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
+
+    // let mut cs: TestShapeCS<G1> = TestShapeCS::new();
+    let initial_table = vec![
+      (<G1 as Group>::Scalar::ZERO, <G1 as Group>::Scalar::ZERO),
+      (<G1 as Group>::Scalar::ONE, <G1 as Group>::Scalar::ONE),
+    ];
+    let mut lookup =
+      Lookup::<<G1 as Group>::Scalar>::new(1024, TableType::ReadWrite, initial_table);
+    let mut lookup_transaction = LookupTransactionSimulate::<G2>::start_transaction(&mut lookup);
+    let prev_intermediate_gamma = <G1 as Group>::Scalar::ONE;
+    let read_value = lookup_transaction.read(<G1 as Group>::Scalar::ZERO);
+    assert_eq!(read_value, <G1 as Group>::Scalar::ZERO);
+    let read_value = lookup_transaction.read(<G1 as Group>::Scalar::ONE);
+    assert_eq!(read_value, <G1 as Group>::Scalar::ONE);
+    lookup_transaction.write(
+      <G1 as Group>::Scalar::ZERO,
+      <G1 as Group>::Scalar::from(111),
+    );
+    let read_value = lookup_transaction.read(<G1 as Group>::Scalar::ZERO);
+    assert_eq!(read_value, <G1 as Group>::Scalar::from(111),);
+
+    let next_intermediate_gamma =
+      lookup_transaction.commit(ro_consts.clone(), prev_intermediate_gamma);
+
+    let mut hasher = <G2 as Group>::RO::new(ro_consts, 1 + 3 * 4);
+    hasher.absorb(prev_intermediate_gamma);
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // addr
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // value
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // counter
+    hasher.absorb(<G1 as Group>::Scalar::ONE); // addr
+    hasher.absorb(<G1 as Group>::Scalar::ONE); // value
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // counter
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // addr
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // value
+    hasher.absorb(<G1 as Group>::Scalar::ONE); // counter
+    hasher.absorb(<G1 as Group>::Scalar::ZERO); // addr
+    hasher.absorb(<G1 as Group>::Scalar::from(111)); // value
+    hasher.absorb(<G1 as Group>::Scalar::from(3)); // counter
+    let res = hasher.squeeze(NUM_CHALLENGE_BITS);
+    assert_eq!(scalar_as_base::<G2>(res), next_intermediate_gamma);
+  }
 
   #[test]
   fn test_read_twice_on_readonly() {
@@ -481,7 +675,7 @@ mod test {
       ),
       (<G1 as Group>::Scalar::ONE, <G1 as Group>::Scalar::ZERO),
     ];
-    let mut lookup = Lookup::<<G1 as Group>::Scalar>::new(false, initial_table);
+    let mut lookup = Lookup::<<G1 as Group>::Scalar>::new(1024, TableType::ReadOnly, initial_table);
     let mut lookup_transaction = LookupTransaction::<G2>::start_transaction(&mut lookup);
     let gamma = AllocatedNum::alloc(cs.namespace(|| "gamma"), || {
       Ok(<G1 as Group>::Scalar::from(2))
@@ -584,7 +778,8 @@ mod test {
       (<G1 as Group>::Scalar::ZERO, <G1 as Group>::Scalar::ZERO),
       (<G1 as Group>::Scalar::ONE, <G1 as Group>::Scalar::ZERO),
     ];
-    let mut lookup = Lookup::<<G1 as Group>::Scalar>::new(true, initial_table);
+    let mut lookup =
+      Lookup::<<G1 as Group>::Scalar>::new(1024, TableType::ReadWrite, initial_table);
     let mut lookup_transaction = LookupTransaction::<G2>::start_transaction(&mut lookup);
     let gamma = AllocatedNum::alloc(cs.namespace(|| "gamma"), || {
       Ok(<G1 as Group>::Scalar::from(2))
