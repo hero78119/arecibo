@@ -62,8 +62,8 @@ fn bench_compressed_snark(c: &mut Criterion) {
     let mut group = c.benchmark_group(format!("CompressedSNARK-StepCircuitSize-{num_cons}"));
     group.sample_size(num_samples);
 
-    let c_primary = NonTrivialTestCircuit::new(num_cons);
-    let c_secondary = TrivialTestCircuit::default();
+    let mut c_primary = NonTrivialTestCircuit::new(num_cons);
+    let mut c_secondary = TrivialTestCircuit::default();
 
     // Produce public parameters
     let pp = PublicParams::<G1, G2, C1, C2>::setup(
@@ -81,8 +81,8 @@ fn bench_compressed_snark(c: &mut Criterion) {
     let num_steps = 3;
     let mut recursive_snark: RecursiveSNARK<G1, G2, C1, C2> = RecursiveSNARK::new(
       &pp,
-      &c_primary,
-      &c_secondary,
+      &mut c_primary,
+      &mut c_secondary,
       vec![<G1 as Group>::Scalar::from(2u64)],
       vec![<G2 as Group>::Scalar::from(2u64)],
     );
@@ -90,8 +90,8 @@ fn bench_compressed_snark(c: &mut Criterion) {
     for i in 0..num_steps {
       let res = recursive_snark.prove_step(
         &pp,
-        &c_primary,
-        &c_secondary,
+        &mut c_primary,
+        &mut c_secondary,
         vec![<G1 as Group>::Scalar::from(2u64)],
         vec![<G2 as Group>::Scalar::from(2u64)],
       );
@@ -155,13 +155,13 @@ fn bench_compressed_snark_with_computational_commitments(c: &mut Criterion) {
       .sampling_mode(SamplingMode::Flat)
       .sample_size(num_samples);
 
-    let c_primary = NonTrivialTestCircuit::new(num_cons);
-    let c_secondary = TrivialTestCircuit::default();
+    let mut c_primary = NonTrivialTestCircuit::new(num_cons);
+    let mut c_secondary = TrivialTestCircuit::default();
 
     // Produce public parameters
     let pp = PublicParams::<G1, G2, C1, C2>::setup(
-      &c_primary,
-      &c_secondary,
+      &mut c_primary,
+      &mut c_secondary,
       Some(SS1::commitment_key_floor()),
       Some(SS2::commitment_key_floor()),
     )
@@ -173,8 +173,8 @@ fn bench_compressed_snark_with_computational_commitments(c: &mut Criterion) {
     let num_steps = 3;
     let mut recursive_snark: RecursiveSNARK<G1, G2, C1, C2> = RecursiveSNARK::new(
       &pp,
-      &c_primary,
-      &c_secondary,
+      &mut c_primary,
+      &mut c_secondary,
       vec![<G1 as Group>::Scalar::from(2u64)],
       vec![<G2 as Group>::Scalar::from(2u64)],
     );
@@ -182,8 +182,8 @@ fn bench_compressed_snark_with_computational_commitments(c: &mut Criterion) {
     for i in 0..num_steps {
       let res = recursive_snark.prove_step(
         &pp,
-        &c_primary,
-        &c_secondary,
+        &mut c_primary,
+        &mut c_secondary,
         vec![<G1 as Group>::Scalar::from(2u64)],
         vec![<G2 as Group>::Scalar::from(2u64)],
       );
@@ -258,7 +258,7 @@ where
   }
 
   fn synthesize<CS: ConstraintSystem<F>>(
-    &self,
+    &mut self,
     cs: &mut CS,
     z: &[AllocatedNum<F>],
   ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
