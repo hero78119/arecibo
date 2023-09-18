@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 
 use bellpepper::gadgets::Assignment;
 use bellpepper_core::{num::AllocatedNum, ConstraintSystem, LinearCombination, SynthesisError};
+use std::cmp::Ord;
 
 use crate::constants::NUM_CHALLENGE_BITS;
 use crate::gadgets::nonnative::util::Num;
@@ -27,7 +28,7 @@ pub enum RWTrace<T> {
 }
 
 /// Lookup in R1CS
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TableType {
   /// read only
   ReadOnly,
@@ -55,7 +56,7 @@ impl<'a, G: Group> LookupTransactionSimulate<'a, G> {
   /// read value from table
   pub fn read(&mut self, addr: G::Base) -> G::Base
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let key = &addr;
     let (value, _) = self.map_aux.entry(*key).or_insert_with(|| {
@@ -72,7 +73,7 @@ impl<'a, G: Group> LookupTransactionSimulate<'a, G> {
   /// write value to lookup table
   pub fn write(&mut self, addr: G::Base, value: G::Base)
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let _ = self.map_aux.insert(
       addr,
@@ -86,7 +87,7 @@ impl<'a, G: Group> LookupTransactionSimulate<'a, G> {
   /// commit rw_trace to lookup
   pub fn commit(&mut self, ro_consts: ROConstants<G>, prev_intermediate_gamma: G::Base) -> G::Base
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let mut hasher = <G as Group>::RO::new(ro_consts, 1 + self.rw_trace.len() * 3);
     hasher.absorb(prev_intermediate_gamma);
@@ -129,7 +130,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     addr: &AllocatedNum<G::Base>,
   ) -> Result<AllocatedNum<G::Base>, SynthesisError>
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let key = &addr.get_value().unwrap_or_default();
     let (value, _) = self.map_aux.entry(*key).or_insert_with(|| {
@@ -155,7 +156,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     value: &AllocatedNum<G::Base>,
   ) -> Result<(), SynthesisError>
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let _ = self.map_aux.insert(
       addr.get_value().unwrap_or_default(),
@@ -191,7 +192,7 @@ impl<'a, G: Group> LookupTransaction<'a, G> {
     SynthesisError,
   >
   where
-    <G as Group>::Base: std::cmp::Ord,
+    <G as Group>::Base: Ord,
   {
     let mut ro = G::ROCircuit::new(
       ro_const,
@@ -276,7 +277,7 @@ impl<F: PrimeField> Lookup<F> {
     initial_table: Vec<(F, F)>,
   ) -> Lookup<F>
   where
-    F: std::cmp::Ord,
+    F: Ord,
   {
     let max_cap_rwcounter_log2 = max_cap_rwcounter.log_2();
     Self {
@@ -293,7 +294,7 @@ impl<F: PrimeField> Lookup<F> {
 
   fn rw_operation(&mut self, is_read: bool, addr: F, external_value: F) -> (F, F)
   where
-    F: std::cmp::Ord,
+    F: Ord,
   {
     // write operations
     if !is_read {
@@ -344,7 +345,7 @@ impl<F: PrimeField> Lookup<F> {
     SynthesisError,
   >
   where
-    F: std::cmp::Ord,
+    F: Ord,
   {
     // extract challenge
     // get content from map
@@ -556,7 +557,7 @@ pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
   let lt = AllocatedNum::alloc(cs.namespace(|| "lt"), || {
     a.get_value()
       .zip(b.get_value())
-      .map(|(a, b)| F::from((a < b) as u64))
+      .map(|(a, b)| F::from(u64::from(a < b)))
       .ok_or(SynthesisError::AssignmentMissing)
   })?;
   cs.enforce(

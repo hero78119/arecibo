@@ -1529,10 +1529,10 @@ mod tests {
       z0_secondary.clone(),
     );
 
-    for mut circuit_primary in roots.iter_mut().take(num_steps) {
+    for circuit_primary in roots.iter_mut().take(num_steps) {
       let res = recursive_snark.prove_step(
         &pp,
-        &mut circuit_primary,
+        circuit_primary,
         &mut circuit_secondary.clone(),
         z0_primary.clone(),
         z0_secondary.clone(),
@@ -1636,12 +1636,11 @@ mod tests {
     test_ivc_base_with::<secp256k1::Point, secq256k1::Point>();
   }
 
-  fn print_constraints_name_on_error_index<G1, G2, C1, C2>(err: &NovaError, mut c_primary: C1)
+  fn print_constraints_name_on_error_index<G1, G2, C1>(err: &NovaError, mut c_primary: C1)
   where
     G1: Group<Base = <G2 as Group>::Scalar>,
     G2: Group<Base = <G1 as Group>::Scalar>,
     C1: StepCircuit<G1::Scalar>,
-    C2: StepCircuit<G2::Scalar>,
   {
     match err {
       NovaError::UnSatIndex(index) => {
@@ -1654,7 +1653,7 @@ mod tests {
           &augmented_circuit_params_primary,
           None,
           &mut c_primary,
-          ro_consts_circuit_primary.clone(),
+          ro_consts_circuit_primary,
         );
         // let mut cs: ShapeCS<G1> = ShapeCS::new();
         // let _ = circuit_primary.synthesize(&mut cs);
@@ -1683,7 +1682,7 @@ mod tests {
 
     impl<G: Group> HeapifyCircuit<G>
     where
-      <G as traits::Group>::Base: std::cmp::Ord,
+      <G as Group>::Base: Ord,
     {
       fn new(heap_size: usize, ro_consts: ROConstantsCircuit<G>) -> (Self, Vec<G::Base>) {
         let n = heap_size; // assume complement binary tree
@@ -1706,11 +1705,8 @@ mod tests {
         );
 
         // TODO challenge should include final table (final table values + counters) commitment
-        let gamma = Self::pre_compute_global_challenge(
-          initial_intermediate_gamma,
-          ((n - 4) / 2) as usize,
-          &lookup,
-        );
+        let gamma =
+          Self::pre_compute_global_challenge(initial_intermediate_gamma, (n - 4) / 2, &lookup);
 
         (
           HeapifyCircuit { lookup, ro_consts },
@@ -1739,7 +1735,7 @@ mod tests {
         let num_steps = initial_index;
         let mut intermediate_gamma = initial_intermediate_gamma;
         // simulate folding step lookup io
-        for i in (0..num_steps + 1).into_iter() {
+        for i in 0..num_steps + 1 {
           let mut lookup_transaction =
             LookupTransactionSimulate::<G>::start_transaction(&mut lookup);
           let addr = G::Base::from((num_steps - i) as u64);
@@ -1759,9 +1755,9 @@ mod tests {
       }
     }
 
-    impl<F: PrimeField, G: Group + traits::Group<Base = F>> StepCircuit<F> for HeapifyCircuit<G>
+    impl<F: PrimeField, G: Group + Group<Base = F>> StepCircuit<F> for HeapifyCircuit<G>
     where
-      G::Base: std::cmp::Ord,
+      G::Base: Ord,
     {
       fn arity(&self) -> usize {
         6
@@ -1804,7 +1800,7 @@ mod tests {
           |lc| lc + CS::one(),
           |lc| lc + right_child_index.get_variable(),
         );
-        let parent = lookup_transaction.read(cs.namespace(|| "parent"), &index)?;
+        let parent = lookup_transaction.read(cs.namespace(|| "parent"), index)?;
         let left_child =
           lookup_transaction.read(cs.namespace(|| "left_child"), &left_child_index)?;
         let right_child =
@@ -1838,7 +1834,7 @@ mod tests {
           &is_right_child_smaller,
         )?;
 
-        lookup_transaction.write(&index, &smallest)?;
+        lookup_transaction.write(index, &smallest)?;
 
         // commit the rw change
         let (next_R, next_W, next_rw_counter, next_intermediate_gamma) = lookup_transaction
@@ -1846,7 +1842,7 @@ mod tests {
             cs.namespace(|| "commit"),
             self.ro_consts.clone(),
             prev_intermediate_gamma,
-            &gamma,
+            gamma,
             prev_W,
             prev_R,
             prev_rw_counter,
@@ -1914,7 +1910,7 @@ mod tests {
       z0_secondary.clone(),
     );
 
-    for i in (0..num_steps).into_iter() {
+    for i in 0..num_steps {
       println!("step i {}", i);
       let res = recursive_snark.prove_step(
         &pp,
@@ -1934,12 +1930,10 @@ mod tests {
     res
       .clone()
       .map_err(|err| {
-        print_constraints_name_on_error_index::<
-          G1,
-          G2,
-          HeapifyCircuit<G2>,
-          TrivialTestCircuit<<G2 as Group>::Scalar>,
-        >(&err, circuit_primary.clone())
+        print_constraints_name_on_error_index::<G1, G2, HeapifyCircuit<G2>>(
+          &err,
+          circuit_primary.clone(),
+        )
       })
       .unwrap();
     assert!(res.is_ok());

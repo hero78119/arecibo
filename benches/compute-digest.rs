@@ -63,7 +63,7 @@ where
   }
 
   fn synthesize<CS: ConstraintSystem<F>>(
-    &self,
+    &mut self,
     cs: &mut CS,
     z: &[AllocatedNum<F>],
   ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
