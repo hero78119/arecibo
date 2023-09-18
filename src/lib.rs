@@ -1668,7 +1668,6 @@ mod tests {
   }
 
   #[test]
-  #[allow(dead_code)]
   fn test_ivc_rwlookup() {
     type G1 = pasta_curves::pallas::Point;
     type G2 = pasta_curves::vesta::Point;
@@ -1678,6 +1677,7 @@ mod tests {
     struct HeapifyCircuit<G: Group> {
       lookup: Lookup<G::Base>,
       ro_consts: ROConstantsCircuit<G>,
+      max_value_bits: usize,
     }
 
     impl<G: Group> HeapifyCircuit<G>
@@ -1708,8 +1708,13 @@ mod tests {
         let gamma =
           Self::pre_compute_global_challenge(initial_intermediate_gamma, (n - 4) / 2, &lookup);
 
+        let max_value_bits = (n - 2).log_2() + 1; // + 1 as a buffer
         (
-          HeapifyCircuit { lookup, ro_consts },
+          HeapifyCircuit {
+            lookup,
+            ro_consts,
+            max_value_bits,
+          },
           vec![
             initial_intermediate_gamma,
             gamma,
@@ -1810,7 +1815,7 @@ mod tests {
           cs.namespace(|| "left_child < parent"),
           &left_child,
           &parent,
-          10, // node value < 2**10 = 1024
+          self.max_value_bits,
         )?;
 
         let tmp = conditionally_select2(
@@ -1824,7 +1829,7 @@ mod tests {
           cs.namespace(|| "right_child < parent"),
           &right_child,
           &tmp,
-          10, // node value < 2**10 = 1024
+          self.max_value_bits,
         )?;
 
         let smallest = conditionally_select2(
@@ -1871,6 +1876,29 @@ mod tests {
       }
     }
 
+    /// A trivial step circuit that simply returns the input
+    #[derive(Clone, Debug, Default, PartialEq, Eq)]
+    pub struct TrivialTestCircuit<F: PrimeField> {
+      _p: PhantomData<F>,
+    }
+
+    impl<F> StepCircuit<F> for TrivialTestCircuit<F>
+    where
+      F: PrimeField,
+    {
+      fn arity(&self) -> usize {
+        1
+      }
+
+      fn synthesize<CS: ConstraintSystem<F>>(
+        &mut self,
+        _cs: &mut CS,
+        z: &[AllocatedNum<F>],
+      ) -> Result<Vec<AllocatedNum<F>>, SynthesisError> {
+        Ok(z.to_vec())
+      }
+    }
+
     let heap_size = 16;
 
     let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
@@ -1879,6 +1907,7 @@ mod tests {
     // let z0_primary = vec![<G1 as Group>::Scalar::ZERO; 6];
 
     let mut circuit_secondary = TrivialTestCircuit::default();
+    // let mut circuit_primary = TrivialTestCircuit::default();
 
     // produce public parameters
     let pp =
@@ -1889,6 +1918,7 @@ mod tests {
         None,
       )
       .unwrap();
+    // println!("num constraints {:?}", pp.num_constraints());
 
     // 5th is initial index.
     // +1 for index end with 0
@@ -1930,10 +1960,7 @@ mod tests {
     res
       .clone()
       .map_err(|err| {
-        print_constraints_name_on_error_index::<G1, G2, HeapifyCircuit<G2>>(
-          &err,
-          circuit_primary.clone(),
-        )
+        print_constraints_name_on_error_index::<G1, G2, _>(&err, circuit_primary.clone())
       })
       .unwrap();
     assert!(res.is_ok());
@@ -1957,6 +1984,11 @@ mod tests {
       <G1 as Group>::Scalar::from((number_of_iterated_nodes * 4) as u64),
       zn_primary[4]
     ); // rw counter = number_of_iterated_nodes * (3r + 1w) operations
+
+    assert_eq!(pp.r1cs_shape_primary.num_cons, 12551);
+    assert_eq!(pp.r1cs_shape_primary.num_vars, 12554);
+    assert_eq!(pp.r1cs_shape_secondary.num_cons, 10347);
+    assert_eq!(pp.r1cs_shape_secondary.num_vars, 10329);
 
     println!("zn_primary {:?}", zn_primary);
     // TODO compression snark

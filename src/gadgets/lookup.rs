@@ -409,14 +409,7 @@ impl<F: PrimeField> Lookup<F> {
       |lc| lc + new_R.get_variable(),
     );
 
-    // RO to get challenge
-    // where the input only cover
-    // ro.absorb(addr);
-    // ro.absorb(&read_value);
-    // ro.absorb(&read_counter);
-
     let alloc_num_one = alloc_one(cs.namespace(|| "one"))?;
-
     // max{read_counter, rw_counter} logic on read-write lookup
     // read_counter on read-only
     // - max{read_counter, rw_counter} if read-write table
@@ -566,25 +559,6 @@ pub fn less_than<F: PrimeField + PartialOrd, CS: ConstraintSystem<F>>(
     |lc| lc + CS::one() - lt.get_variable(),
     |lc| lc,
   );
-  // println!(
-  //   "a {:?}, b {:?}, diff {:?}, range {:?}, lt {:?}",
-  //   a.get_value(),
-  //   b.get_value(),
-  //   diff.get_value(),
-  //   range.get_value(),
-  //   lt.get_value(),
-  // );
-  // println!(
-  //   "{:?} =  {:?}",
-  //   lt.get_value()
-  //     .zip(range.get_value())
-  //     .map(|(lt, range)| lt * range),
-  //   diff
-  //     .get_value()
-  //     .zip(a.get_value())
-  //     .zip(b.get_value())
-  //     .map(|((diff, a), b)| diff - a + b),
-  // );
   cs.enforce(
     || "lt ⋅ range == diff - lhs + rhs",
     |lc| lc + lt.get_variable(),
