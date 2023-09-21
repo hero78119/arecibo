@@ -917,10 +917,15 @@ mod tests {
   };
   use crate::gadgets::utils::{alloc_const, alloc_one, conditionally_select2};
   use crate::provider::bn256_grumpkin::{bn256, grumpkin};
+  use crate::provider::keccak::Keccak256Transcript;
   use crate::provider::pedersen::CommitmentKeyExtTrait;
   use crate::provider::poseidon::PoseidonConstantsCircuit;
   use crate::provider::secp_secq::{secp256k1, secq256k1};
   use crate::spartan::math::Math;
+  use crate::spartan::polys::univariate::{CompressedUniPoly, UniPoly};
+  use crate::spartan::ppsnark::{ProductSumcheckInstance, SumcheckEngine};
+  use crate::spartan::sumcheck::SumcheckProof;
+  use crate::traits::TranscriptEngineTrait;
 
   use super::*;
   type EE1<G1> = provider::ipa_pc::EvaluationEngine<G1>;
@@ -1684,17 +1689,12 @@ mod tests {
     where
       <G as Group>::Base: Ord,
     {
-      fn new(heap_size: usize, ro_consts: ROConstantsCircuit<G>) -> (Self, Vec<G::Base>) {
-        let n = heap_size; // assume complement binary tree
-        let initial_table = (0..n - 1)
-          .map(|i| {
-            (
-              <G as Group>::Base::from(i as u64),
-              <G as Group>::Base::from((n - 2 - i) as u64),
-            )
-          })
-          .collect();
-        let lookup = Lookup::new(n * 4, TableType::ReadWrite, initial_table);
+      fn new(
+        initial_table: &Lookup<G::Base>,
+        ro_consts: ROConstantsCircuit<G>,
+      ) -> (Self, Vec<G::Base>, Lookup<G::Base>) {
+        let n = initial_table.table_size();
+        let initial_table = initial_table.clone();
 
         let (initial_intermediate_gamma, init_prev_R, init_prev_W, init_rw_counter, initial_index) = (
           G::Base::from(1),
@@ -1705,13 +1705,16 @@ mod tests {
         );
 
         // TODO challenge should include final table (final table values + counters) commitment
-        let gamma =
-          Self::pre_compute_global_challenge(initial_intermediate_gamma, (n - 4) / 2, &lookup);
+        let (gamma, final_lookup_table) = Self::pre_compute_global_challenge(
+          initial_intermediate_gamma,
+          (n - 4) / 2,
+          &initial_table,
+        );
 
         let max_value_bits = (n - 2).log_2() + 1; // + 1 as a buffer
         (
           HeapifyCircuit {
-            lookup,
+            lookup: initial_table,
             ro_consts,
             max_value_bits,
           },
@@ -1723,6 +1726,7 @@ mod tests {
             init_rw_counter,
             initial_index,
           ],
+          final_lookup_table,
         )
       }
 
@@ -1732,7 +1736,7 @@ mod tests {
         initial_intermediate_gamma: G::Base,
         initial_index: usize,
         lookup: &Lookup<G::Base>,
-      ) -> G::Base {
+      ) -> (G::Base, Lookup<G::Base>) {
         let ro_consts =
         <<G as Group>::RO as ROTrait<<G as Group>::Base, <G as Group>::Scalar>>::Constants::default();
 
@@ -1756,7 +1760,7 @@ mod tests {
           lookup_transaction.write(addr, tmp);
           intermediate_gamma = lookup_transaction.commit(ro_consts.clone(), intermediate_gamma)
         }
-        intermediate_gamma
+        (intermediate_gamma, lookup)
       }
     }
 
@@ -1899,10 +1903,24 @@ mod tests {
       }
     }
 
-    let heap_size = 16;
+    let heap_size = 4;
 
     let ro_consts: ROConstantsCircuit<G2> = PoseidonConstantsCircuit::default();
-    let (mut circuit_primary, z0_primary) = HeapifyCircuit::new(heap_size, ro_consts);
+
+    let initial_table = {
+      let initial_table = (0..heap_size)
+        .map(|i| {
+          (
+            <G2 as Group>::Base::from(i as u64),
+            <G2 as Group>::Base::from((heap_size - 1 - i) as u64),
+          )
+        })
+        .collect();
+      Lookup::new(heap_size * 4, TableType::ReadWrite, initial_table)
+    };
+
+    let (mut circuit_primary, z0_primary, final_table) =
+      HeapifyCircuit::new(&initial_table, ro_consts);
     // let mut circuit_primary = TrivialTestCircuit::default();
     // let z0_primary = vec![<G1 as Group>::Scalar::ZERO; 6];
 
@@ -1985,12 +2003,99 @@ mod tests {
       zn_primary[4]
     ); // rw counter = number_of_iterated_nodes * (3r + 1w) operations
 
-    assert_eq!(pp.r1cs_shape_primary.num_cons, 12551);
-    assert_eq!(pp.r1cs_shape_primary.num_vars, 12554);
+    assert_eq!(pp.r1cs_shape_primary.num_cons, 12537);
+    assert_eq!(pp.r1cs_shape_primary.num_vars, 12540);
     assert_eq!(pp.r1cs_shape_secondary.num_cons, 10347);
     assert_eq!(pp.r1cs_shape_secondary.num_vars, 10329);
 
     println!("zn_primary {:?}", zn_primary);
+
+    // we only need init_row and audit_row productsumcheck, as read_row/write_row as being folded in folding
+    let gamma = z0_primary[1];
+    let gamma_square = gamma * gamma;
+    let hash_func = |addr: &<G1 as Group>::Scalar,
+                     val: &<G1 as Group>::Scalar,
+                     ts: &<G1 as Group>::Scalar|
+     -> <G1 as Group>::Scalar {
+      gamma - (*addr + *val * gamma + *ts * gamma + gamma_square)
+    };
+    // init_row
+    let initial_row: Vec<<G1 as Group>::Scalar> = initial_table
+      .get_table()
+      .iter()
+      .map(|(addr, value, counter)| hash_func(addr, value, counter))
+      .collect();
+    // audit_row
+    let audit_row: Vec<<G1 as Group>::Scalar> = final_table
+      .get_table()
+      .iter()
+      .map(|(addr, value, counter)| hash_func(addr, value, counter))
+      .collect();
+
+    let mut transcript = <G1 as Group>::TE::new(b"test");
+    let mut mem_sc_inst = ProductSumcheckInstance::<G1>::new(
+      &pp.ck_primary,
+      vec![initial_row, audit_row],
+      &mut transcript,
+    )
+    .unwrap();
+
+    let claims = mem_sc_inst.initial_claims();
+    println!("initial claims {:?}", claims);
+    let num_claims = claims.len();
+    let coeffs = {
+      let s = transcript.squeeze(b"r").unwrap();
+      let mut s_vec = vec![s];
+      for i in 1..num_claims {
+        s_vec.push(s_vec[i - 1] * s);
+      }
+      s_vec
+    };
+    // compute the joint claim
+    let claim = claims
+      .iter()
+      .zip(coeffs.iter())
+      .map(|(c_1, c_2)| *c_1 * c_2)
+      .sum();
+    let mut e = claim;
+    let mut r: Vec<<G1 as Group>::Scalar> = Vec::new();
+    let mut cubic_polys: Vec<CompressedUniPoly<<G1 as Group>::Scalar>> = Vec::new();
+    let num_rounds = mem_sc_inst.size().log_2();
+
+    for _i in 0..num_rounds {
+      let mut evals: Vec<Vec<<G1 as Group>::Scalar>> = Vec::new();
+      evals.extend(mem_sc_inst.evaluation_points());
+
+      let evals_combined_0 = (0..evals.len()).map(|i| evals[i][0] * coeffs[i]).sum();
+      let evals_combined_2 = (0..evals.len()).map(|i| evals[i][1] * coeffs[i]).sum();
+      let evals_combined_3 = (0..evals.len()).map(|i| evals[i][2] * coeffs[i]).sum();
+
+      let evals = vec![
+        evals_combined_0,
+        e - evals_combined_0,
+        evals_combined_2,
+        evals_combined_3,
+      ];
+      let poly = UniPoly::from_evals(&evals);
+
+      // append the prover's message to the transcript
+      transcript.absorb(b"p", &poly);
+
+      // derive the verifier's challenge for the next round
+      let r_i = transcript.squeeze(b"c").unwrap();
+      r.push(r_i);
+
+      mem_sc_inst.bound(&r_i);
+
+      e = poly.evaluate(&r_i);
+      cubic_polys.push(poly.compress());
+    }
+
+    let _mem_claims = mem_sc_inst.final_claims();
+    println!("final claim {:?}", _mem_claims);
+
+    let _product_sumcheck_proof = SumcheckProof::<G1>::new(cubic_polys);
+
     // TODO compression snark
   }
 }

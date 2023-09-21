@@ -292,6 +292,21 @@ impl<F: PrimeField> Lookup<F> {
     }
   }
 
+  /// get table vector
+  /// very costly operation
+  pub fn get_table(&self) -> Vec<(F, F, F)> {
+    self
+      .map_aux
+      .iter()
+      .map(|(addr, (value, counter))| (*addr, *value, *counter))
+      .collect()
+  }
+
+  /// table size
+  pub fn table_size(&self) -> usize {
+    self.map_aux.len()
+  }
+
   fn rw_operation(&mut self, is_read: bool, addr: F, external_value: F) -> (F, F)
   where
     F: Ord,

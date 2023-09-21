@@ -269,7 +269,9 @@ impl<G: Group> R1CSShapeSparkRepr<G> {
       x
     };
 
+    // giving challenge r_x_padded, we evaluate eq(r_x_padded) on N points as read-only mem
     let mem_row = EqPolynomial::new(r_x_padded).evals();
+    // giving z, we set z as random oracle.
     let mem_col = {
       let mut val = vec![G::Scalar::ZERO; self.N];
       for (i, v) in z.iter().enumerate() {
@@ -321,7 +323,8 @@ pub trait SumcheckEngine<G: Group> {
   fn final_claims(&self) -> Vec<Vec<G::Scalar>>;
 }
 
-struct ProductSumcheckInstance<G: Group> {
+/// ProductSumcheckInstance
+pub struct ProductSumcheckInstance<G: Group> {
   pub(crate) claims: Vec<G::Scalar>, // claimed products
   pub(crate) comm_output_vec: Vec<Commitment<G>>,
 
@@ -335,6 +338,7 @@ struct ProductSumcheckInstance<G: Group> {
 }
 
 impl<G: Group> ProductSumcheckInstance<G> {
+  /// new a productsumcheck instance
   pub fn new(
     ck: &CommitmentKey<G>,
     input_vec: Vec<Vec<G::Scalar>>, // list of input vectors
